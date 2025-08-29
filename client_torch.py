@@ -91,6 +91,12 @@ class TorchClient(fl.client.NumPyClient):
             raise RuntimeError(f"Client {cid}: too few rows in shard ({len(X)}).")
         X = X[[c for c in DEFAULT_FEATURES if c in X.columns]].copy()
         self.train_loader, self.val_loader = make_loaders(X, y)
+
+        # Store full validation features as a tensor for SHAP
+        X_val_full = X.iloc[int(0.8*len(X)):]  # matches the val split
+        y_val_full = y.iloc[int(0.8*len(y)):]
+        self.X_val_tensor, self.y_val_tensor = get_tensors(X_val_full, y_val_full)
+
         # Model
         self.model = MLP(in_features=X.shape[1]).to(self.device)
         self.criterion = nn.BCELoss()
@@ -149,16 +155,15 @@ class TorchClient(fl.client.NumPyClient):
 
 
     def compute_shap_summary(self, max_background=50, max_eval=200):
-        # Use a small background + subset for speed
-        X_val = next(iter(self.val_loader))[0]  # just grab the features
-        bg = X_val[:max_background].to(self.device)
-        eval_x = X_val[:max_eval].to(self.device)
+        # Use the stored full validation tensor
+        bg = self.X_val_tensor[:max_background].to(self.device)
+        eval_x = self.X_val_tensor[:max_eval].to(self.device)
 
         self.model.eval()
         # Do NOT use torch.no_grad() here; SHAP needs gradients
         explainer = shap.DeepExplainer(self.model, bg)
         shap_vals = explainer.shap_values(eval_x)
-
+        
         # shap returns a list for multi-output; for binary just pick first
         if isinstance(shap_vals, list):
             shap_vals = shap_vals[0]
