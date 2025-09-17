@@ -119,36 +119,46 @@ class TorchClient(fl.client.NumPyClient):
         for _ in range(epochs):
             train_one_epoch(self.model, self.train_loader, self.criterion, self.optimizer, self.device)
         loss, acc = evaluate(self.model, self.val_loader, self.device)
-        return self.get_parameters(config={}), len(self.train_loader.dataset), {"val_loss": loss, "val_acc": acc}
+        # Collect data quality stats, privacy info, etc.
+        data_quality_stats = self.compute_data_quality_stats()
+        privacy_info = self.get_privacy_info()
+        robustness_stats = self.get_robustness_stats(parameters)
+
+        # Flatten metrics
+        metrics = {
+            "val_loss": loss,
+            "val_acc": acc,
+        }
+        # Flatten data_quality_stats
+        for k, v in data_quality_stats.items():
+            metrics[f"data_quality_{k}"] = v
+        # Flatten privacy_info
+        for k, v in privacy_info.items():
+            metrics[f"privacy_{k}"] = v
+        # Flatten robustness_stats
+        for k, v in robustness_stats.items():
+            metrics[f"robustness_{k}"] = v
+
+        return self.get_parameters(config={}), len(self.train_loader.dataset), metrics
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         loss, acc = evaluate(self.model, self.val_loader, self.device)
 
-        shap_mean = 0.0
-        try:
-            shap_summary = self.compute_shap_summary()
-
-            # Save locally to disk per round
-            save_dir = f"shap_outputs/client_{self.cid}"
-            os.makedirs(save_dir, exist_ok=True)
-            np.save(os.path.join(save_dir, f"round_{config.get('server_round', 0)}.npy"),
-                    shap_summary)
-
-            # Optional: also keep JSON if you prefer
-            with open(os.path.join(save_dir, f"round_{config.get('server_round', 0)}.json"), "w") as f:
-                json.dump(shap_summary.tolist(), f)
-
-            # Send only a scalar summary back to server
-            shap_mean = float(np.mean(np.abs(shap_summary)))
-
-        except Exception as e:
-            print(f"[Client {self.cid}] SHAP failed: {e}")
-
+        shap_vec = self.compute_shap_summary()  # full vector
+        shap_flat = np.array(shap_vec).flatten().tolist()
         metrics = {
             "val_acc": float(acc),
-            "shap_mean": shap_mean,   # ✅ scalar, safe for Flower
+            "shap_vec": shap_vec.tolist(),  # send full vector
         }
+
+        # Flatten shap_vec to a 1D list of floats
+        shap_flat = np.array(shap_vec).flatten().tolist()
+        metrics = {
+            "val_acc": float(acc),
+        }
+        for i, v in enumerate(shap_flat):
+            metrics[f"shap_{i}"] = float(v)
 
         return float(loss), len(self.val_loader.dataset), metrics
 
@@ -172,6 +182,17 @@ class TorchClient(fl.client.NumPyClient):
         mean_abs = np.mean(np.abs(shap_vals), axis=0)  # shape (n_features,)
         return mean_abs
 
+    def compute_data_quality_stats(self):
+        # TODO: Implement actual data quality stats for trust scoring
+        return {}
+
+    def get_privacy_info(self):
+        # TODO: Implement actual privacy info reporting for trust scoring
+        return {}
+
+    def get_robustness_stats(self, parameters):
+        # TODO: Implement actual robustness stats for trust scoring
+        return {}
 
 
 def main():
