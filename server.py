@@ -1,3 +1,4 @@
+import json
 import os
 import numpy as np
 import flwr as fl
@@ -24,6 +25,7 @@ class FedReX(fl.server.strategy.FedAvg):
         }
         self.historical_scores = {}  # {cid: score}
         self.global_shap = None      # reference SHAP vector (update each round)
+        self.global_shap_history = {}  # Store all rounds' SHAP
 
     # --- Trust score sub-components ---
     def score_data_quality(self, metrics, data_stats):
@@ -100,33 +102,38 @@ class FedReX(fl.server.strategy.FedAvg):
         return updates[0]  # placeholder
 
     def aggregate_evaluate(self, rnd, results, failures):
-        # Optionally, update self.global_shap here for explanation alignment
-        # You can also compute trust scores for evaluation metrics
         agg_metrics = super().aggregate_evaluate(rnd, results, failures)
 
-        # Collect SHAP vectors from clients
         shap_vecs, weights = [], []
         for _, eval_res in results:
             metrics = eval_res.metrics
-            if "shap" in metrics:
-                shap_vecs.append(np.array(metrics["shap"]))
+            # Collect SHAP values as a list of floats (shap_0, shap_1, ...)
+            shap = [metrics[k] for k in sorted(metrics) if k.startswith("shap_")]
+            if shap:
+                shap_vecs.append(np.array(shap))
                 weights.append(eval_res.num_examples)
 
-        # Weighted average of SHAP importances across clients
         if shap_vecs:
             shap_vecs = np.vstack(shap_vecs)
             weights = np.array(weights, dtype=float)
             weights /= weights.sum()
             global_shap = np.average(shap_vecs, axis=0, weights=weights)
 
-            # Print top-5 features each round (indices only, since server doesn’t know names)
+            # Print top-5 features each round
             top_idx = np.argsort(global_shap)[::-1][:5]
             print(f"[Round {rnd}] Global SHAP top-5 features (by index):")
             for i in top_idx:
                 print(f"  Feature {i}: {global_shap[i]:.6f}")
 
+            # Store in history and write to single file
+            self.global_shap_history[rnd] = global_shap.tolist()
+            os.makedirs("shap_outputs", exist_ok=True)
+            out_path = "shap_outputs/global_shap.json"
+            with open(out_path, "w") as f:
+                json.dump(self.global_shap_history, f, indent=2)
+
         return agg_metrics
-        # TODO: update self.global_shap if SHAP vectors are reported
+
 
 class FedAvgWithSHAP(fl.server.strategy.FedAvg):
     def aggregate_evaluate(self, rnd, results, failures):
