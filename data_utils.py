@@ -34,6 +34,8 @@ def load_and_engineer(csv_path: str) -> pd.DataFrame:
     # Add polynomial feature
     if "bmi" in df.columns:
         df["bmi2"] = df["bmi"] ** 2
+    
+    df = df.replace([np.inf, -np.inf], np.nan)
 
     # Impute missing values
     df = impute_missing(df)
@@ -64,13 +66,13 @@ def load_and_engineer(csv_path: str) -> pd.DataFrame:
 
 
 def impute_missing(df: pd.DataFrame) -> pd.DataFrame:
-    # Impute continuous features with mean, categorical with mode
     for col in df.columns:
         if df[col].dtype in [np.float64, np.int64]:
             imp = SimpleImputer(strategy="mean")
         else:
             imp = SimpleImputer(strategy="most_frequent")
         df[col] = imp.fit_transform(df[[col]])
+    df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
     return df
 
 
@@ -100,7 +102,9 @@ def remove_outliers(df: pd.DataFrame, z_thresh: float = 3.0) -> pd.DataFrame:
 def scale_features(df: pd.DataFrame, continuous_features: list) -> pd.DataFrame:
     scaler = RobustScaler()
     df[continuous_features] = scaler.fit_transform(df[continuous_features])
+    df[continuous_features] = np.nan_to_num(df[continuous_features], nan=0.0, posinf=0.0, neginf=0.0)
     return df
+
 
 
 def drop_high_corr(df: pd.DataFrame, threshold=0.95) -> pd.DataFrame:
@@ -111,11 +115,14 @@ def drop_high_corr(df: pd.DataFrame, threshold=0.95) -> pd.DataFrame:
 
 
 def split_by_client(df: pd.DataFrame, num_clients: int, cid: int) -> Tuple[pd.DataFrame, pd.Series]:
-    idx = np.arange(len(df))
-    mask = (idx % num_clients) == cid
-    shard = df.loc[mask].reset_index(drop=True)
+    n = len(df)
+    shard_size = n // num_clients
+    start = cid * shard_size
+    end = (cid + 1) * shard_size if cid < num_clients - 1 else n
+    shard = df.iloc[start:end].reset_index(drop=True)
+    print(f"[Client {cid}] Data split: {len(shard)} samples")
     X = shard.drop(columns=[TARGET])
-    X = X.copy()  # Use all columns except target
+    X = X.copy()
     X = X[[c for c in X.columns if c != "cardio"]]
     y = shard[TARGET].astype(int)
     return X, y
