@@ -179,22 +179,37 @@ class TorchClient(fl.client.NumPyClient):
 
 
     def compute_shap_summary(self, max_background=50, max_eval=200):
-        # Use the stored full validation tensor
-        bg = self.X_val_tensor[:max_background].to(self.device)
-        eval_x = self.X_val_tensor[:max_eval].to(self.device)
+        # Ensure tensors are finite and clean
+        bg = self.X_val_tensor[:max_background].clone().to(self.device)
+        eval_x = self.X_val_tensor[:max_eval].clone().to(self.device)
+
+        # Replace NaNs/Infs in the inputs
+        bg = torch.nan_to_num(bg, nan=0.0, posinf=0.0, neginf=0.0)
+        eval_x = torch.nan_to_num(eval_x, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.model.eval()
-        # Do NOT use torch.no_grad() here; SHAP needs gradients
+        # SHAP requires gradients, do NOT use torch.no_grad()
         explainer = shap.DeepExplainer(self.model, bg)
-        shap_vals = explainer.shap_values(eval_x)
-        
-        # shap returns a list for multi-output; for binary just pick first
+
+        try:
+            shap_vals = explainer.shap_values(eval_x)
+        except Exception as e:
+            print(f"[SHAP ERROR] {e}")
+            # fallback: zeros
+            shap_vals = np.zeros(eval_x.shape[1])
+
+        # shap returns list for multi-output
         if isinstance(shap_vals, list):
             shap_vals = shap_vals[0]
 
+        # Convert to numpy and safe-guard NaN/Inf
         shap_vals = shap_vals.cpu().numpy() if torch.is_tensor(shap_vals) else np.array(shap_vals)
+        shap_vals = np.nan_to_num(shap_vals, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # mean absolute SHAP per feature
         mean_abs = np.mean(np.abs(shap_vals), axis=0)  # shape (n_features,)
         return mean_abs
+
 
     def compute_data_quality_stats(self):
         df = self.train_loader.dataset.tensors[0].numpy()

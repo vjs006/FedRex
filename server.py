@@ -106,18 +106,24 @@ class FedReX(fl.server.strategy.FedAvg):
         return float(S_Priv_c)
 
     def score_robustness(self, update, ref_update, stats):
-        # flatten updates into vectors
-        try:
-            update_vec = update.flatten()
-        except Exception:
-            update_vec = np.zeros(1, dtype=np.float64)
+        def params_to_vec(params):
+            if params is None:
+                return np.zeros(1, dtype=np.float64)
 
-        try:
-            ref_vec = ref_update.flatten()
-        except Exception:
-            ref_vec = np.zeros(1, dtype=np.float64)
+            if isinstance(params, Parameters):
+                # Decode bytes -> np arrays
+                arrays = parameters_to_ndarrays(params)
+                return np.concatenate([arr.flatten() for arr in arrays])
 
-        # now safe to nan_to_num
+            # fallback if already array-like
+            try:
+                return np.array(params).flatten()
+            except Exception:
+                return np.zeros(1, dtype=np.float64)
+
+        update_vec = params_to_vec(update)
+        ref_vec = params_to_vec(ref_update)
+
         update_vec = np.nan_to_num(update_vec, nan=0.0, posinf=0.0, neginf=0.0)
         ref_vec = np.nan_to_num(ref_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -125,9 +131,13 @@ class FedReX(fl.server.strategy.FedAvg):
         norm_ref = np.linalg.norm(ref_vec)
         if norm_update == 0 or norm_ref == 0:
             return 0.0
+
         return 0.5 * (1 + np.dot(update_vec, ref_vec) / (norm_update * norm_ref))
 
+
     def compute_trust_score(self, cid, metrics, data_stats, shap_vec, privacy_info, update, ref_update, stats, global_metrics, global_shap):
+        if not hasattr(self, "global_shap") or self.global_shap is None:
+            self.global_shap = [np.zeros_like(param) for param in parameters_to_ndarrays(update)]
         scores = {
             "DQ": self.score_data_quality(metrics, data_stats),
             "Perf": self.score_performance(metrics, global_metrics),
@@ -189,7 +199,6 @@ class FedReX(fl.server.strategy.FedAvg):
         updates = []
 
         for cid, fit_res in results:
-            # Extract client-side flattened metrics etc.
             data_stats, privacy_info, robustness_stats, shap_vec = extract_client_stats(fit_res.metrics)
             ts = self.compute_trust_score(
                 cid=cid,
@@ -198,18 +207,17 @@ class FedReX(fl.server.strategy.FedAvg):
                 shap_vec=shap_vec,
                 privacy_info=privacy_info,
                 update=fit_res.parameters,
-                ref_update=None,
+                ref_update=None,  # optional: can pass self.global_parameters
                 stats=robustness_stats,
                 global_metrics=None,
                 global_shap=self.global_shap,
             )
             trust_scores.append(float(ts))
 
-            # Decode the parameters object (fit_res.parameters may be Flower Parameters or list[bytes])
-            # We'll append it as-is to `updates` and let aggregate_parameters_weighted handle decoding.
+            # Always append parameters object; do NOT skip
             updates.append(fit_res.parameters)
 
-        # Normalize trust scores safely (clip to non-negative)
+        # Normalize trust scores safely
         weights = np.array(trust_scores, dtype=np.float64)
         weights = np.clip(weights, a_min=0.0, a_max=None)
         denom = weights.sum()
