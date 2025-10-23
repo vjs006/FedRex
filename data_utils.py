@@ -120,9 +120,15 @@ def split_by_client(df: pd.DataFrame, num_clients: int, cid: int) -> Tuple[pd.Da
     start = cid * shard_size
     end = (cid + 1) * shard_size if cid < num_clients - 1 else n
     shard = df.iloc[start:end].reset_index(drop=True)
+
+    if len(shard) == 0:
+        print(f"[Client {cid}] Empty dataset shard! Adjusting range manually.")
+        start = max(0, start - shard_size)
+        end = min(n, start + shard_size)
+        shard = df.iloc[start:end].reset_index(drop=True)
+
     print(f"[Client {cid}] Data split: {len(shard)} samples")
     X = shard.drop(columns=[TARGET])
-    X = X.copy()
-    X = X[[c for c in X.columns if c != "cardio"]]
     y = shard[TARGET].astype(int)
     return X, y
+
