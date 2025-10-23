@@ -70,6 +70,51 @@ class FedReX(fl.server.strategy.FedAvg):
         S_DQ_c = (S_prod ** beta) / (1 + zeta * S_var)
         return float(S_DQ_c)
 
+    def aggregate_evaluate(self, rnd, results, failures):
+        # Call the default FedAvg aggregation for loss/acc etc.
+        agg_results = super().aggregate_evaluate(rnd, results, failures)
+        
+        # --- SHAP aggregation to update self.global_shap ---
+        shap_vecs, weights = [], []
+        for _, eval_res in results:
+            metrics = eval_res.metrics
+            # Only consider clients that successfully computed SHAP (i.e., when DP was off)
+            shap_metrics = {k: v for k, v in metrics.items() if k.startswith("shap_")}
+            if shap_metrics:
+                # Reconstruct the vector based on index
+                max_idx = max(int(k.split("_")[1]) for k in shap_metrics)
+                shap_vec = np.zeros(max_idx + 1)
+                for k, v in shap_metrics.items():
+                    idx = int(k.split("_")[1])
+                    if idx <= max_idx:
+                        shap_vec[idx] = v
+                
+                shap_vecs.append(shap_vec)
+                weights.append(eval_res.num_examples)
+
+        if shap_vecs:
+            # Pad vectors if they have different lengths (due to varying features per client)
+            max_len = max(len(v) for v in shap_vecs)
+            padded_shap_vecs = []
+            for v in shap_vecs:
+                padded_v = np.pad(v, (0, max_len - len(v)), 'constant', constant_values=0)
+                padded_shap_vecs.append(padded_v)
+                
+            shap_vecs = np.vstack(padded_shap_vecs)
+            weights = np.array(weights, dtype=float)
+            weights /= weights.sum()
+            self.global_shap = np.average(shap_vecs, axis=0, weights=weights)
+            self.global_shap_history[rnd] = self.global_shap
+            
+            # Print top-5 features (as in FedAvgWithSHAP)
+            if self.global_shap.size > 0:
+                top_idx = np.argsort(self.global_shap)[::-1][:5]
+                print(f"[Round {rnd}] Global SHAP top-5 features (by index):")
+                for i in top_idx:
+                    print(f"  Feature {i}: {self.global_shap[i]:.6f}")
+
+        return agg_results
+
     def score_performance(self, metrics, global_metrics):
         # Balanced accuracy improvement
         # Assume metrics["val_acc"] is balanced accuracy
@@ -194,77 +239,85 @@ class FedReX(fl.server.strategy.FedAvg):
         return arr
 
     
+    # server.py (Modified FedReX.aggregate_fit)
+
     def aggregate_fit(self, rnd, results, failures):
         trust_scores = []
         updates = []
+        
+        # --- Trust Score Calculation (Your original logic) ---
+        global_metrics = None # You'd need to compute/fetch this if needed
+        # We need a reference for robustness score if we want to use it properly
+        ref_update = self.current_parameters if hasattr(self, 'current_parameters') else None
 
         for cid, fit_res in results:
+            # cid is actually the client ID (int) provided by Flower, not the fit_res object
+            
+            # Use the index in the results list as a temporary ID for historical_scores if Flower's cid is complex
+            client_id = str(cid) 
             data_stats, privacy_info, robustness_stats, shap_vec = extract_client_stats(fit_res.metrics)
+            
+            # If round 1, global_shap is None, so Exp score defaults to 1.0 (as coded)
             ts = self.compute_trust_score(
-                cid=cid,
+                cid=client_id,
                 metrics=fit_res.metrics,
                 data_stats=data_stats,
                 shap_vec=shap_vec,
                 privacy_info=privacy_info,
                 update=fit_res.parameters,
-                ref_update=None,  # optional: can pass self.global_parameters
+                ref_update=ref_update, 
                 stats=robustness_stats,
-                global_metrics=None,
+                global_metrics=global_metrics, # Pass aggregated metrics from previous round if available
                 global_shap=self.global_shap,
             )
             trust_scores.append(float(ts))
-
-            # Always append parameters object; do NOT skip
             updates.append(fit_res.parameters)
-
-        # Normalize trust scores safely
+            
+        # ... (Normalize trust scores safely - your original logic is fine) ...
         weights = np.array(trust_scores, dtype=np.float64)
         weights = np.clip(weights, a_min=0.0, a_max=None)
         denom = weights.sum()
         if denom <= 0.0:
-            # fallback to equal weights
             weights = np.ones_like(weights) / float(len(weights))
         else:
             weights = weights / denom
+            
+        # Aggregate parameters (returns list of np.ndarrays)
+        agg_ndarrays = self.aggregate_parameters_weighted(updates, weights)
 
-        # Aggregate parameters
-        agg_bytes = self.aggregate_parameters_weighted(updates, weights)
-
-        # Return as Flower Parameters object
-        agg_params_obj = Parameters(tensors=agg_bytes, tensor_type="numpy")
+        # CRUCIAL: Convert list of ndarrays back to Flower Parameters object
+        agg_params_obj = ndarrays_to_parameters(agg_ndarrays)
+        
+        # Store the aggregated parameters for the next round's robustness calculation
+        self.current_parameters = agg_params_obj 
+        
+        # Return aggregated parameters and metrics (FedReX doesn't aggregate fit metrics, but should return a dictionary)
         return agg_params_obj, {}
 
 
 
-    def aggregate_parameters_weighted(self, updates, weights):
-        # Convert all updates into lists of np.ndarrays
+    def aggregate_parameters_weighted(self, updates: List[Parameters], weights: np.ndarray):
+        
         updates_np = []
         for u in updates:
+            # Flower's standard way to get ndarrays from Parameters
             arrs = parameters_to_ndarrays(u)
-            cleaned = []
-            for a in arrs:
-                if isinstance(a, (bytes, np.bytes_)):
-                    a = np.load(io.BytesIO(a), allow_pickle=False)
-                elif isinstance(a, np.ndarray) and a.shape == () and isinstance(a.item(), (bytes, np.bytes_)):
-                    a = np.load(io.BytesIO(a.item()), allow_pickle=False)
-                elif "torch" in str(type(a)):
-                    a = a.detach().cpu().numpy()
-                a = np.array(a, dtype=np.float64)
-                cleaned.append(a)
-            updates_np.append(cleaned)
+            # Convert to float64 for stable aggregation
+            updates_np.append([np.array(a, dtype=np.float64) for a in arrs])
 
-        weights = np.array(weights, dtype=np.float64)
-        if weights.sum() == 0:
-            weights = np.ones_like(weights) / len(weights)
+        # ... (weights normalization remains the same) ...
 
         # Layer-wise aggregation
         agg_params = []
-        for layer_idx, layer_arrays in enumerate(zip(*updates_np)):
+        # Use zip(*updates_np) to iterate over layers
+        for layer_arrays in zip(*updates_np): 
             stacked = np.stack(layer_arrays, axis=0)
             agg_layer = np.average(stacked, axis=0, weights=weights)
             agg_layer = np.nan_to_num(agg_layer, nan=0.0, posinf=0.0, neginf=0.0)
+            # Convert back to float32 for model consistency
             agg_params.append(agg_layer.astype(np.float32))
 
+        # IMPORTANT: Return a list of np.ndarrays
         return agg_params
 
 class FedAvgWithSHAP(fl.server.strategy.FedAvg):

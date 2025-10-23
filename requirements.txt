@@ -5,3 +5,4 @@ pandas>=1.5
 numpy>=1.23
 lightgbm>=4.0
 shap>=0.43
+opacus=1.5.4
