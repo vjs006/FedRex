@@ -37,13 +37,23 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, Any]]]) -> Dict[str, flo
 class FedReX(fl.server.strategy.FedAvg):
     def __init__(self, alpha_dict=None, **kwargs):
         super().__init__(**kwargs)
-        # Trust score weights (sum to 1)
         self.alpha_dict = alpha_dict or {
             "DQ": 0.2, "Perf": 0.2, "Exp": 0.2, "His": 0.15, "Priv": 0.1, "Rob": 0.15
         }
         self.historical_scores = {}  # {cid: score}
         self.global_shap = None      # reference SHAP vector (update each round)
         self.global_shap_history = {}  # Store all rounds' SHAP
+        self.global_shap_filename = "shap_outputs/global_shap.json"
+        
+        self.feature_map = {}
+        try:
+            with open("shap_outputs/feature_names.json", 'r') as f:
+                feature_data = json.load(f)
+                # Assuming all clients share the same feature order/count for global SHAP
+                self.feature_names = feature_data.get("0", [f"Feature {i}" for i in range(50)]) 
+        except FileNotFoundError:
+            print(f"[SERVER] WARNING: feature_names.json not found. Using generic names.")
+            self.feature_names = [f"Feature {i}" for i in range(50)]
 
     # --- Trust score sub-components ---
     def score_data_quality(self, metrics, data_stats):
@@ -70,6 +80,8 @@ class FedReX(fl.server.strategy.FedAvg):
         S_DQ_c = (S_prod ** beta) / (1 + zeta * S_var)
         return float(S_DQ_c)
 
+    # server.py (Rewritten FedReX.aggregate_evaluate)
+
     def aggregate_evaluate(self, rnd, results, failures):
         # Call the default FedAvg aggregation for loss/acc etc.
         agg_results = super().aggregate_evaluate(rnd, results, failures)
@@ -78,11 +90,9 @@ class FedReX(fl.server.strategy.FedAvg):
         shap_vecs, weights = [], []
         for _, eval_res in results:
             metrics = eval_res.metrics
-            # Only consider clients that successfully computed SHAP (i.e., when DP was off)
             shap_metrics = {k: v for k, v in metrics.items() if k.startswith("shap_")}
             if shap_metrics:
-                # Reconstruct the vector based on index
-                max_idx = max(int(k.split("_")[1]) for k in shap_metrics)
+                max_idx = max((int(k.split("_")[1]) for k in shap_metrics), default=-1)
                 shap_vec = np.zeros(max_idx + 1)
                 for k, v in shap_metrics.items():
                     idx = int(k.split("_")[1])
@@ -92,26 +102,62 @@ class FedReX(fl.server.strategy.FedAvg):
                 shap_vecs.append(shap_vec)
                 weights.append(eval_res.num_examples)
 
+        # --- Global SHAP Calculation and Feature Mapping ---
         if shap_vecs:
-            # Pad vectors if they have different lengths (due to varying features per client)
+            # 1. Calculate the aggregated SHAP vector
             max_len = max(len(v) for v in shap_vecs)
-            padded_shap_vecs = []
-            for v in shap_vecs:
-                padded_v = np.pad(v, (0, max_len - len(v)), 'constant', constant_values=0)
-                padded_shap_vecs.append(padded_v)
-                
+            padded_shap_vecs = [
+                np.pad(v, (0, max_len - len(v)), 'constant', constant_values=0)
+                for v in shap_vecs
+            ]
+            
             shap_vecs = np.vstack(padded_shap_vecs)
             weights = np.array(weights, dtype=float)
             weights /= weights.sum()
             self.global_shap = np.average(shap_vecs, axis=0, weights=weights)
-            self.global_shap_history[rnd] = self.global_shap
             
-            # Print top-5 features (as in FedAvgWithSHAP)
+            # 2. CRITICAL FIX: Ensure self.feature_names covers all indices
+            required_len = len(self.global_shap)
+            current_len = len(self.feature_names)
+            
+            if required_len > current_len:
+                # Extend the feature names list with generic names up to the required length
+                self.feature_names.extend([
+                    f"Unknown Feature {i}" 
+                    for i in range(current_len, required_len)
+                ])
+            
+            # 3. Store ALL SHAP values for the round
+            current_round_shap_data = {}
+            for i in range(required_len):
+                # This lookup is now guaranteed to work because the list was extended
+                feature_name = self.feature_names[i] 
+                v = self.global_shap[i]
+                current_round_shap_data[feature_name] = float(v)
+            
+            self.global_shap_history[rnd] = current_round_shap_data
+            
+            # 4. Printing with Feature Names (Top 5 only)
             if self.global_shap.size > 0:
                 top_idx = np.argsort(self.global_shap)[::-1][:5]
-                print(f"[Round {rnd}] Global SHAP top-5 features (by index):")
+                print(f"[Round {rnd}] Global SHAP top-5 features:")
                 for i in top_idx:
-                    print(f"  Feature {i}: {self.global_shap[i]:.6f}")
+                    # Use a try/except block just for the printing to handle potential mismatches gracefully
+                    try:
+                        feature_name = self.feature_names[i]
+                        print(f"  {feature_name}: {self.global_shap[i]:.6f}")
+                    except IndexError:
+                        print(f"  Feature {i}: {self.global_shap[i]:.6f} (Name Index Error)") # Should not happen now
+
+        # --- JSON Storage ---
+        os.makedirs(os.path.dirname(self.global_shap_filename), exist_ok=True)
+        try:
+            with open(self.global_shap_filename, 'w') as f:
+                # This now writes the complete current_round_shap_data which includes all features
+                json.dump(self.global_shap_history, f, indent=4)
+            print(f"[SERVER] SHAP data saved to {self.global_shap_filename}")
+        except Exception as e:
+            print(f"[SERVER] WARNING: Failed to save SHAP data to JSON: {e}")
 
         return agg_results
 
@@ -126,16 +172,40 @@ class FedReX(fl.server.strategy.FedAvg):
         return float(S_Perf_c)
 
     def score_explanation(self, shap_vec, global_shap):
-        # L1 and cosine similarity
         if shap_vec is None or global_shap is None:
             return 1.0
+
         shap_vec = np.array(shap_vec)
         global_shap = np.array(global_shap)
         eps = 1e-8
-        S_L1 = 1 - np.sum(np.abs(shap_vec - global_shap)) / (np.sum(np.abs(global_shap)) + eps)
-        S_cos = np.dot(shap_vec, global_shap) / ((np.linalg.norm(shap_vec) + eps) * (np.linalg.norm(global_shap) + eps))
+        
+        # --- Robustness Check & Padding ---
+        if global_shap.size > shap_vec.size:
+            # Pad client vector to match global length
+            shap_vec = np.pad(shap_vec, (0, global_shap.size - shap_vec.size), 'constant', constant_values=0.0)
+        elif shap_vec.size > global_shap.size:
+            # Pad global vector (unlikely, but safe)
+            global_shap = np.pad(global_shap, (0, shap_vec.size - global_shap.size), 'constant', constant_values=0.0)
+            
+        # Ensure non-zero norms for stability
+        norm_shap = np.linalg.norm(shap_vec)
+        norm_global = np.linalg.norm(global_shap)
+        
+        if norm_global == 0 or norm_shap == 0:
+            return 1.0 # Or 0.5, depending on how you penalize zero SHAP
+
+        # --- Calculation ---
+        
+        # S_L1 (Normalized L1 difference, lower is better)
+        S_L1 = 1 - (np.sum(np.abs(shap_vec - global_shap)) / (np.sum(np.abs(global_shap)) + eps))
+        
+        # S_cos (Cosine similarity, higher is better)
+        S_cos = np.dot(shap_vec, global_shap) / ((norm_shap * norm_global) + eps)
+        
         S_Exp_c = 0.5 * (S_L1 + S_cos)
-        return float(S_Exp_c)
+        
+        # Ensure score is within [0, 1] bounds
+        return float(np.clip(S_Exp_c, 0.0, 1.0))
 
     def score_history(self, cid):
         prev = self.historical_scores.get(cid, 1.0)

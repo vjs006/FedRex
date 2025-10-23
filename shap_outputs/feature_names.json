@@ -1,0 +1,21 @@
+{
+    "0": [
+        "age",
+        "height",
+        "weight",
+        "ap_hi",
+        "ap_lo",
+        "pulse_pressure",
+        "bmi",
+        "age_bmi",
+        "pp_chol",
+        "bmi2",
+        "cholesterol_2",  
+        "cholesterol_3",  
+        "gluc_2",
+        "gluc_3",
+        "smoke_1",
+        "alco_1",
+        "active_1"
+    ]
+}

@@ -32,10 +32,16 @@ class MLP(nn.Module):
 
 
 def get_tensors(X: pd.DataFrame, y: pd.Series) -> Tuple[torch.Tensor, torch.Tensor]:
-    X = X.fillna(X.median(numeric_only=True))
+    X_numeric = X.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+    
+    X_np = X_numeric.values
+    if X_np.dtype == np.dtype('object_'):
+        X_np = X_np.astype(np.float32)
+        
     y = y.fillna(y.mode().iloc[0] if not y.mode().empty else 0)
+    
     return (
-        torch.tensor(X.values, dtype=torch.float32),
+        torch.tensor(X_np, dtype=torch.float32), 
         torch.tensor(y.values, dtype=torch.float32).view(-1, 1),
     )
 
@@ -98,39 +104,54 @@ class TorchClient(fl.client.NumPyClient):
         self.cid = cid
         self.num_clients = num_clients
         self.device = torch.device("cpu")
-
-        # --- Data load ---
+        
+        # --- Data load and feature engineering ---
         df = load_and_engineer(data_path)
-        X, y = split_by_client(df, num_clients, cid)
-        if len(X) == 0:
+        X_full, y = split_by_client(df, num_clients, cid)
+        
+        if len(X_full) == 0:
             raise RuntimeError(f"[Client {cid}] Empty data shard!")
 
-        X = X[[c for c in DEFAULT_FEATURES if c in X.columns]].copy()
+        # Data Cleaning Block
+        X = X_full.copy()
+        # This cleanup is redundant in init but kept for safety/debugging data types.
+        X = X.apply(pd.to_numeric, errors='coerce').fillna(0.0) 
+        
         y = y.fillna(0).reset_index(drop=True)
+        
+        # Finalize feature list and size
         self.feature_names = list(X.columns)
-
+        in_features = X.shape[1]
+        
+        # --- Debug Confirmation ---
         print(f"[Client {cid}] Data split: {len(X)} samples")
-
+        print("-" * 50)
+        print("FINAL FEATURE COUNT:", len(self.feature_names))
+        print("FINAL FEATURE NAMES LIST:", self.feature_names) 
+        print("-" * 50)
+        
+        # --- Data Loaders ---
         self.train_loader, self.val_loader = make_loaders(X, y)
-        X_val_full = X.iloc[int(0.8 * len(X)):]
-        y_val_full = y.iloc[int(0.8 * len(y)):]
+        
+        # Prepare validation tensors for SHAP background data
+        n_train = int(0.8 * len(X))
+        X_val_full = X.iloc[n_train:]
+        y_val_full = y.iloc[n_train:]
         self.X_val_tensor, self.y_val_tensor = get_tensors(X_val_full, y_val_full)
 
         # --- Dual Model setup ---
-        in_features = X.shape[1]
         
-        # 1. Base model (vanilla MLP) - used to restore state and for SHAP weights
+        # 1. Base model (Vanilla MLP) - NOW self.device IS AVAILABLE
         self.base_model = MLP(in_features=in_features).to(self.device)
         
-        # 2. DP Model (the one used for training and parameter exchange)
-        # We start by linking self.model to the base model.
+        # 2. DP Model 
         self.model = self.base_model
         
-        # 3. SHAP Model (vanilla MLP copy, used exclusively for evaluation/SHAP)
+        # 3. SHAP Model 
         self.shap_model = MLP(in_features=in_features).to(self.device)
-        self.shap_model.load_state_dict(self.base_model.state_dict()) # Initial synchronization
+        self.shap_model.load_state_dict(self.base_model.state_dict()) 
 
-        self.criterion = nn.BCELoss()
+        self.criterion = nn.BCELoss() # <-- Also essential setup
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
 
         # --- DP setup ---
