@@ -15,7 +15,6 @@ import shap
 
 from data_utils import load_and_engineer, split_by_client, DEFAULT_FEATURES
 
-
 class MLP(nn.Module):
     def __init__(self, in_features: int, hidden1=64, hidden2=32, out_features=1):
         super().__init__()
@@ -117,9 +116,20 @@ class TorchClient(fl.client.NumPyClient):
         y_val_full = y.iloc[int(0.8 * len(y)):]
         self.X_val_tensor, self.y_val_tensor = get_tensors(X_val_full, y_val_full)
 
-        # --- Model setup ---
-        self.base_model = MLP(in_features=X.shape[1]).to(self.device) 
-        self.model = self.base_model # 'self.model' will be the wrapped model if DP is on
+        # --- Dual Model setup ---
+        in_features = X.shape[1]
+        
+        # 1. Base model (vanilla MLP) - used to restore state and for SHAP weights
+        self.base_model = MLP(in_features=in_features).to(self.device)
+        
+        # 2. DP Model (the one used for training and parameter exchange)
+        # We start by linking self.model to the base model.
+        self.model = self.base_model
+        
+        # 3. SHAP Model (vanilla MLP copy, used exclusively for evaluation/SHAP)
+        self.shap_model = MLP(in_features=in_features).to(self.device)
+        self.shap_model.load_state_dict(self.base_model.state_dict()) # Initial synchronization
+
         self.criterion = nn.BCELoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
 
@@ -128,47 +138,73 @@ class TorchClient(fl.client.NumPyClient):
         self.dp_delta = 1e-5
         self.dp_noise_multiplier = 1.0
         self.dp_max_grad_norm = 1.0
-        
-        # Call DP setup AFTER initial model/optimizer setup
+
         self._init_privacy_engine()
 
+    # client_torch.py (Replace the entire _init_privacy_engine method)
+
+    # client_torch.py (Corrected _init_privacy_engine)
+
     def _init_privacy_engine(self):
-        """Safely initialize DP with fallback."""
+        """Safely initialize DP using the older Opacus make_private API (v1.x)."""
+        
         try:
-            sample_rate = len(next(iter(self.train_loader))[0]) / len(self.train_loader.dataset)
-            if sample_rate <= 0:
-                raise ValueError("Invalid sample_rate")
+            # 1. Instantiate the base PrivacyEngine object (no arguments)
             privacy_engine = PrivacyEngine()
+
+            # 2. Use make_private to wrap the module, optimizer, and dataloader.
+            # This is where DP hyper-parameters are passed in Opacus v1.x.
+            # This call replaces self.model, self.optimizer, and self.train_loader
+            # with their DP-wrapped counterparts.
             self.model, self.optimizer, self.train_loader = privacy_engine.make_private(
                 module=self.model,
                 optimizer=self.optimizer,
                 data_loader=self.train_loader,
                 noise_multiplier=self.dp_noise_multiplier,
                 max_grad_norm=self.dp_max_grad_norm,
+                # target_delta is handled by get_epsilon later, not directly in make_private.
             )
+            
+            # The wrapped model contains a reference to the original module
+            # that we use in fit() for weight synchronization with self.shap_model.
             self.privacy_engine = privacy_engine
-            print(f"[Client {self.cid}] PrivacyEngine initialized successfully.")
+            print(f"[Client {self.cid}] PrivacyEngine initialized successfully (v1.x API).")
+            
         except Exception as e:
+            # The DP setup failed (likely a version or configuration issue)
             print(f"[Client {self.cid}] Warning: DP init failed ({e}). Continuing without DP.")
             self.privacy_engine = None
 
+
     def get_parameters(self, config=None):
+        # We return the parameters of the model used for training (self.model)
+        # The parameters must be obtained from the currently active model (DP-wrapped or not)
         return [p.cpu().detach().numpy().astype(np.float32) for _, p in self.model.state_dict().items()]
 
     def set_parameters(self, parameters):
-        state_dict = self.model.state_dict()
+        # 1. Update the training/DP model (self.model)
+        state_dict_dp = self.model.state_dict()
+        if len(parameters) == len(state_dict_dp):
+            for (k, _), arr in zip(state_dict_dp.items(), parameters):
+                state_dict_dp[k] = torch.tensor(np.array(arr, dtype=np.float32))
+            self.model.load_state_dict(state_dict_dp, strict=True)
+            
+        # 2. Update the vanilla SHAP model (self.shap_model)
+        # This is CRUCIAL: we update the SHAP model with the base weights
+        # We assume the first layers of state_dict_dp contain the actual model weights.
+        state_dict_shap = self.shap_model.state_dict()
         
-        # Ensure parameters list length matches state_dict keys
-        if len(parameters) != len(state_dict):
-            print(f"[Client {self.cid}] Parameter mismatch! Expected {len(state_dict)}, got {len(parameters)}")
-            return 
-            
-        for (k, _), arr in zip(state_dict.items(), parameters):
-            state_dict[k] = torch.tensor(np.array(arr, dtype=np.float32))
-            
-        self.model.load_state_dict(state_dict, strict=True)
-
-        self.model.train()
+        # Only take the weights corresponding to the SHAP model's state_dict keys.
+        # This handles cases where the DP model has extra optimizer/meta layers.
+        
+        # Ensure we only load the weights that the vanilla MLP has
+        vanilla_keys = list(state_dict_shap.keys())
+        
+        # Parameters array contains parameters in the same order as get_parameters returns them
+        if len(parameters) >= len(vanilla_keys):
+            for i, key in enumerate(vanilla_keys):
+                state_dict_shap[key] = torch.tensor(np.array(parameters[i], dtype=np.float32))
+            self.shap_model.load_state_dict(state_dict_shap, strict=True)
 
     def fit(self, parameters, config):
         try:
@@ -176,14 +212,28 @@ class TorchClient(fl.client.NumPyClient):
                 self.set_parameters(parameters)
 
             epochs = int(config.get("local_epochs", 1)) if config else 1
+            
+            # --- Training with DP (self.model is DP-wrapped) ---
             for _ in range(epochs):
                 train_loss = train_one_epoch(self.model, self.train_loader, self.criterion, self.optimizer, self.device)
+            
+            # --- Sync final trained weights to the SHAP model ---
+            # This is complex with Opacus. The simplest way is to manually copy the original module state
+            # assuming Opacus's hooks are not necessary for evaluation/SHAP
+            if self.privacy_engine is not None and hasattr(self.model, 'original_module'):
+                # If DP is on, sync the clean weights from the wrapped module to the SHAP model
+                self.shap_model.load_state_dict(self.model.original_module.state_dict(), strict=True)
+            elif self.privacy_engine is None:
+                # If DP is off, self.model is the base model, sync it directly
+                self.shap_model.load_state_dict(self.model.state_dict(), strict=True)
 
-            val_loss, val_acc = evaluate(self.model, self.val_loader, self.device)
+
+            # --- Evaluation Metrics (using the vanilla SHAP model) ---
+            val_loss, val_acc = evaluate(self.shap_model, self.val_loader, self.device)
             metrics = self.compute_data_quality_stats()
             metrics.update({"train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc})
 
-            # --- Privacy accounting ---
+            # --- Privacy accounting (S_Priv,c) ---
             epsilon = 0.0
             delta = self.dp_delta
             if self.privacy_engine is not None:
@@ -195,11 +245,13 @@ class TorchClient(fl.client.NumPyClient):
             metrics.update({"privacy_epsilon": float(epsilon), "privacy_delta": float(delta)})
 
             # --- Robustness ---
+            # Use parameters from the DP model for robustness norm
             params_np = [np.frombuffer(p.tobytes(), dtype=np.float32) for p in self.get_parameters()]
             metrics["robustness_norm"] = float(sum(np.sum(p ** 2) for p in params_np))
             metrics["robustness_diversity"] = 0.8
 
             print(f"[Client {self.cid}] Done: val_acc={val_acc:.3f}, ε={epsilon:.3f}")
+            # Return DP-trained model parameters
             return self.get_parameters(), len(self.train_loader.dataset), metrics
 
         except Exception as e:
@@ -207,32 +259,30 @@ class TorchClient(fl.client.NumPyClient):
             raise
 
     def evaluate(self, parameters, config):
+        # 1. Update both models with global parameters
         self.set_parameters(parameters)
         
-        # Use the currently loaded model (which might be the DP-wrapped one) for loss/acc
-        loss, acc = evaluate(self.model, self.val_loader, self.device) 
+        # 2. Evaluate performance using the vanilla SHAP model
+        loss, acc = evaluate(self.shap_model, self.val_loader, self.device)
 
+        # 3. Compute SHAP on the vanilla SHAP model (S_Exp,c)
         shap_vals = np.zeros(len(self.feature_names))
-        
-        if self.privacy_engine is None: 
-            try:
-                if self.privacy_engine is None:
-                    shap_vals = self.compute_shap_summary() 
-                    
-            except Exception as e:
-                print(f"[Client {self.cid}] SHAP error: {e}") 
+        try:
+            # We explicitly pass the vanilla model for SHAP calculation
+            shap_vals = self.compute_shap_summary(model=self.shap_model)
+        except Exception as e:
+            print(f"[Client {self.cid}] SHAP error: {e}")
 
         metrics = {"val_acc": acc}
-        
-        if shap_vals.size > 0:
-            for i, v in enumerate(shap_vals.flatten()):
-                metrics[f"shap_{i}"] = float(v)
-                
-        # Only return required metrics for the evaluate phase
+        for i, v in enumerate(shap_vals.flatten()):
+            metrics[f"shap_{i}"] = float(v)
+            
+        # If DP was active in fit, the shap_vals are based on the latest DP-trained weights
         return float(loss), len(self.val_loader.dataset), metrics
 
-
+    # ---------------- Data Quality ----------------
     def compute_data_quality_stats(self):
+        # ... (no change) ...
         try:
             X_np = self.train_loader.dataset.tensors[0].numpy()
             y_np = self.train_loader.dataset.tensors[1].ravel()
@@ -269,11 +319,17 @@ class TorchClient(fl.client.NumPyClient):
             })
         return metrics
 
-    def compute_shap_summary(self, max_background=50, max_eval=200):
-        self.model.eval()
+    # ---------------- SHAP ----------------
+    def compute_shap_summary(self, model, max_background=50, max_eval=200):
+        # SHAP calculation uses the provided vanilla model
+        model.eval()
         bg = torch.nan_to_num(self.X_val_tensor[:max_background]).to(self.device)
         eval_x = torch.nan_to_num(self.X_val_tensor[:max_eval]).to(self.device)
-        explainer = shap.DeepExplainer(self.model, bg)
+        
+        # Note: If Opacus's model is used here, it will crash.
+        # But since we use self.shap_model, which is vanilla, it's fine.
+        explainer = shap.DeepExplainer(model, bg)
+        
         shap_vals = explainer.shap_values(eval_x)
         shap_vals = shap_vals[0] if isinstance(shap_vals, list) else shap_vals
         return np.mean(np.abs(np.nan_to_num(shap_vals)), axis=0)
