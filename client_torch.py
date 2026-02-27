@@ -24,7 +24,6 @@ class MLP(nn.Module):
             nn.Linear(hidden1, hidden2),
             nn.ReLU(),
             nn.Linear(hidden2, out_features),
-            nn.Sigmoid(),
         )
 
     def forward(self, x):
@@ -81,22 +80,34 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 
 def evaluate(model, loader, device):
     model.eval()
-    preds, trues = [], []
+    logits_all = []
+    trues_all = []
+
     with torch.no_grad():
         for xb, yb in loader:
-            out = model(xb.to(device)).cpu().numpy().ravel()
-            preds.append(out)
-            trues.append(yb.cpu().numpy().ravel())
-    if not preds:
+            logits = model(xb.to(device))
+            logits_all.append(logits.cpu())
+            trues_all.append(yb.cpu())
+
+    if not logits_all:
         return 0.0, 0.0
-    preds = np.concatenate(preds)
-    trues = np.concatenate(trues)
-    preds = np.nan_to_num(preds)
-    trues = np.nan_to_num(trues)
-    acc = accuracy_score((trues > 0.5).astype(int), (preds > 0.5).astype(int))
-    loss_fn = nn.BCELoss()
-    loss = loss_fn(torch.tensor(preds, dtype=torch.float32).view(-1, 1),
-                   torch.tensor(trues, dtype=torch.float32).view(-1, 1)).item()
+
+    logits = torch.cat(logits_all)
+    trues = torch.cat(trues_all)
+
+    # Convert logits → probabilities
+    probs = torch.sigmoid(logits)
+    preds = (probs > 0.5).float()
+
+    acc = accuracy_score(
+        trues.numpy().ravel(),
+        preds.numpy().ravel()
+    )
+
+    # Proper loss for logits
+    loss_fn = nn.BCEWithLogitsLoss()
+    loss = loss_fn(logits, trues).item()
+
     return float(loss), float(acc)
 
 class TorchClient(fl.client.NumPyClient):
@@ -151,7 +162,21 @@ class TorchClient(fl.client.NumPyClient):
         self.shap_model = MLP(in_features=in_features).to(self.device)
         self.shap_model.load_state_dict(self.base_model.state_dict()) 
 
-        self.criterion = nn.BCELoss() # <-- Also essential setup
+        # ----- Class imbalance handling -----
+        train_y = self.train_loader.dataset.tensors[1]
+        pos_ratio = train_y.mean().item()
+
+        if pos_ratio == 0:
+            pos_weight_value = 1.0
+        else:
+            pos_weight_value = (1 - pos_ratio) / pos_ratio
+
+        print(f"[Client {cid}] Positive ratio: {pos_ratio:.4f}")
+        print(f"[Client {cid}] pos_weight: {pos_weight_value:.4f}")
+
+        pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32)
+
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
 
         # --- DP setup ---
@@ -171,20 +196,20 @@ class TorchClient(fl.client.NumPyClient):
         
         try:
             # 1. Instantiate the base PrivacyEngine object (no arguments)
-            privacy_engine = PrivacyEngine()
+            # privacy_engine = PrivacyEngine()
 
-            # 2. Use make_private to wrap the module, optimizer, and dataloader.
-            # This is where DP hyper-parameters are passed in Opacus v1.x.
-            # This call replaces self.model, self.optimizer, and self.train_loader
-            # with their DP-wrapped counterparts.
-            self.model, self.optimizer, self.train_loader = privacy_engine.make_private(
-                module=self.model,
-                optimizer=self.optimizer,
-                data_loader=self.train_loader,
-                noise_multiplier=self.dp_noise_multiplier,
-                max_grad_norm=self.dp_max_grad_norm,
-                # target_delta is handled by get_epsilon later, not directly in make_private.
-            )
+            # # 2. Use make_private to wrap the module, optimizer, and dataloader.
+            # # This is where DP hyper-parameters are passed in Opacus v1.x.
+            # # This call replaces self.model, self.optimizer, and self.train_loader
+            # # with their DP-wrapped counterparts.
+            # self.model, self.optimizer, self.train_loader = privacy_engine.make_private(
+            #     module=self.model,
+            #     optimizer=self.optimizer,
+            #     data_loader=self.train_loader,
+            #     noise_multiplier=self.dp_noise_multiplier,
+            #     max_grad_norm=self.dp_max_grad_norm,
+            #     # target_delta is handled by get_epsilon later, not directly in make_private.
+            # )
             
             # The wrapped model contains a reference to the original module
             # that we use in fit() for weight synchronization with self.shap_model.
@@ -232,7 +257,7 @@ class TorchClient(fl.client.NumPyClient):
             if parameters:
                 self.set_parameters(parameters)
 
-            epochs = int(config.get("local_epochs", 1)) if config else 1
+            epochs = 5
             
             # --- Training with DP (self.model is DP-wrapped) ---
             for _ in range(epochs):

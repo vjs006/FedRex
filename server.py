@@ -351,7 +351,7 @@ class FedReX(fl.server.strategy.FedAvg):
             weights = np.ones_like(weights) / float(len(weights))
         else:
             weights = weights / denom
-            
+
         # Aggregate parameters (returns list of np.ndarrays)
         agg_ndarrays = self.aggregate_parameters_weighted(updates, weights)
 
@@ -535,6 +535,94 @@ def compute_data_quality_stats(df, y):
         stats[f] = {"comp": S_comp, "valid": S_valid, "uniq": S_uniq, "out": S_out, "mi": S_mi}
 
     return stats
+
+def save_global_model(parameters, strategy):
+    import os, joblib, torch, pandas as pd
+    import numpy as np
+    from client_torch import MLP
+    from flwr.common import parameters_to_ndarrays
+    from sklearn.preprocessing import RobustScaler
+    
+    # 1. Load Raw Data
+    df = pd.read_csv("cardio_train.csv", sep=";")
+    
+    # 2. Engineering (NO SCALING) - Matches Streamlit App Logic
+    if "age" in df.columns and df["age"].max() > 200:
+        df["age"] = (df["age"] / 365).astype(int)
+    
+    df["pulse_pressure"] = df["ap_hi"] - df["ap_lo"]
+    h_m = df["height"] / 100.0
+    df["bmi"] = df["weight"] / (h_m ** 2)
+    df["age_bmi"] = df["age"] * df["bmi"]
+    df["bmi2"] = df["bmi"] ** 2
+    
+    # Explicitly define cat features to ensure 17 columns
+    cat_features = ["cholesterol", "gluc", "smoke", "alco", "active"]
+    df = pd.get_dummies(df, columns=cat_features, drop_first=True)
+    
+    X = df.drop(columns=["cardio", "id"], errors="ignore")
+    feature_names = list(X.columns) # This is 17 features
+    
+    # 3. FIT AND SAVE THE SCALER (17 Features)
+    scaler = RobustScaler()
+    scaler.fit(X)
+    
+    age_idx = feature_names.index("age")
+    print(f"!!! SCALER CHECK !!!")
+    print(f"Age center (Should be ~50): {scaler.center_[age_idx]}")
+    print(f"[SERVER] Scaler fitted on {len(feature_names)} features.")
+    
+    joblib.dump(scaler, "scaler.pkl")
+
+    # 4. REBUILD MODEL (FORCE 17 INPUTS)
+    ndarrays = parameters_to_ndarrays(parameters)
+    
+    # We define the model with 17 features to match the Scaler
+    model = MLP(in_features=len(feature_names))
+    state_dict = model.state_dict()
+    
+    # 5. SAFE PARAMETER MAPPING
+    # If clients sent 16 but we need 17, we fill the last weight with 0.0
+    new_params = {}
+    for i, (key, val) in enumerate(zip(state_dict.keys(), ndarrays)):
+        # If this is the first layer weight matrix [64, 17]
+        if "weight" in key and val.shape != state_dict[key].shape:
+            print(f"[WARN] Shape mismatch for {key}. Padding weights to fit 17 features.")
+            # Create a zero tensor of the correct shape [64, 17]
+            padded_val = torch.zeros(state_dict[key].shape)
+            # Copy the 16 available feature weights into the first 16 slots
+            padded_val[:, :val.shape[1]] = torch.tensor(val)
+            new_params[key] = padded_val
+        else:
+            new_params[key] = torch.tensor(val)
+
+    model.load_state_dict(new_params, strict=False)
+    model.eval()
+
+    # 6. SAVE BUNDLE (17 Features)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "feature_names": feature_names, # Save all 17 names
+        "global_shap_json": getattr(strategy, 'global_shap_json', None)
+    }, "global_model_bundle.pt")
+    
+    print(f"[SERVER] Global model bundle saved with {len(feature_names)} features.")
+    
+def main():
+    address = os.environ.get("BIND_ADDRESS", "0.0.0.0:8080")
+    strategy = get_strategy()
+
+    print(f"Starting Flower server on {address} …")
+
+    fl.server.start_server(
+        server_address=address,
+        config=fl.server.ServerConfig(num_rounds=10),
+        strategy=strategy,
+    )
+
+    # After training finishes
+    if hasattr(strategy, "current_parameters"):
+        save_global_model(strategy.current_parameters, strategy)
 
 if __name__ == "__main__":
     main()
