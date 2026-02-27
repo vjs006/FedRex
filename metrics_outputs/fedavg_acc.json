@@ -1,0 +1,122 @@
+[
+    {
+        "round": 1,
+        "val_acc": 0.0
+    },
+    {
+        "round": 2,
+        "val_acc": 0.0
+    },
+    {
+        "round": 3,
+        "val_acc": 0.0
+    },
+    {
+        "round": 4,
+        "val_acc": 0.0
+    },
+    {
+        "round": 5,
+        "val_acc": 0.0
+    },
+    {
+        "round": 6,
+        "val_acc": 0.0
+    },
+    {
+        "round": 7,
+        "val_acc": 0.0
+    },
+    {
+        "round": 8,
+        "val_acc": 0.0
+    },
+    {
+        "round": 9,
+        "val_acc": 0.0
+    },
+    {
+        "round": 10,
+        "val_acc": 0.0
+    },
+    {
+        "round": 1,
+        "val_acc": 0.0
+    },
+    {
+        "round": 2,
+        "val_acc": 0.0
+    },
+    {
+        "round": 3,
+        "val_acc": 0.0
+    },
+    {
+        "round": 4,
+        "val_acc": 0.0
+    },
+    {
+        "round": 5,
+        "val_acc": 0.0
+    },
+    {
+        "round": 6,
+        "val_acc": 0.0
+    },
+    {
+        "round": 7,
+        "val_acc": 0.0
+    },
+    {
+        "round": 8,
+        "val_acc": 0.0
+    },
+    {
+        "round": 9,
+        "val_acc": 0.0
+    },
+    {
+        "round": 10,
+        "val_acc": 0.0
+    },
+    {
+        "round": 1,
+        "val_acc": 0.7242798353909465
+    },
+    {
+        "round": 2,
+        "val_acc": 0.7249657064471879
+    },
+    {
+        "round": 3,
+        "val_acc": 0.7265660722450846
+    },
+    {
+        "round": 4,
+        "val_acc": 0.725880201188843
+    },
+    {
+        "round": 5,
+        "val_acc": 0.7254229538180156
+    },
+    {
+        "round": 6,
+        "val_acc": 0.7254229538180156
+    },
+    {
+        "round": 7,
+        "val_acc": 0.725880201188843
+    },
+    {
+        "round": 8,
+        "val_acc": 0.7245084590763603
+    },
+    {
+        "round": 9,
+        "val_acc": 0.724737082761774
+    },
+    {
+        "round": 10,
+        "val_acc": 0.725880201188843
+    }
+]

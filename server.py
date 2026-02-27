@@ -7,9 +7,115 @@ from typing import List, Tuple, Dict, Any
 import torch
 from flwr.common import Parameters
 import io
+import matplotlib.pyplot as plt
+import sys
 from sklearn.preprocessing import KBinsDiscretizer
 from sklearn.metrics import mutual_info_score
 from flwr.common import parameters_to_ndarrays, ndarrays_to_parameters
+
+# ---------------- PLOTTING UTILITIES (NO SIDE EFFECTS) ---------------- #
+
+def plot_trust_dynamics(trust_history_path="trust_outputs/trust_history.json"):
+    if not os.path.exists(trust_history_path):
+        return
+
+    with open(trust_history_path, "r") as f:
+        trust_history = json.load(f)
+
+    os.makedirs("plots", exist_ok=True)
+
+    # ---- Per-client trust evolution ----
+    plt.figure()
+    for cid, scores in trust_history.items():
+        plt.plot(range(1, len(scores) + 1), scores, label=f"Client {cid[-4:]}")
+    plt.xlabel("Round")
+    plt.ylabel("Trust Score")
+    plt.title("Dynamic Trust Score Evolution")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("plots/trust_per_client.png", dpi=300)
+    plt.close()
+
+    # ---- Average trust over rounds ----
+    max_len = max(len(v) for v in trust_history.values())
+    avg_trust = []
+    for r in range(max_len):
+        vals = [v[r] for v in trust_history.values() if len(v) > r]
+        avg_trust.append(np.mean(vals))
+
+    plt.figure()
+    plt.plot(range(1, len(avg_trust) + 1), avg_trust, marker="o")
+    plt.xlabel("Round")
+    plt.ylabel("Average Trust Score")
+    plt.title("Average Trust Score Across Rounds")
+    plt.grid(True)
+    plt.savefig("plots/trust_average.png", dpi=300)
+    plt.close()
+
+
+def plot_acc_convergence(acc_path="metrics_outputs/fedrex_acc.json"):
+    if not os.path.exists(acc_path):
+        return
+
+    with open(acc_path, "r") as f:
+        data = json.load(f)
+
+    rounds = [d["round"] for d in data]
+    acc = [d["val_acc"] for d in data]
+
+    os.makedirs("plots", exist_ok=True)
+
+    plt.figure()
+    plt.plot(rounds, acc, marker="o")
+    plt.xlabel("Round")
+    plt.ylabel("Acc-score")
+    plt.title("FedReX Global Acc-score Convergence")
+    plt.grid(True)
+    plt.savefig("plots/fedrex_Acc_convergence.png", dpi=300)
+    plt.close()
+
+
+def plot_final_trust_vs_weight(trust_history_path="trust_outputs/trust_history.json"):
+    if not os.path.exists(trust_history_path):
+        return
+
+    with open(trust_history_path, "r") as f:
+        trust_history = json.load(f)
+
+    final_trust = np.array([v[-1] for v in trust_history.values()])
+    weights = final_trust / final_trust.sum()
+
+    plt.figure()
+    plt.scatter(final_trust, weights)
+    plt.xlabel("Final Trust Score")
+    plt.ylabel("Aggregation Weight")
+    plt.title("Client Contribution vs Trust Score")
+    plt.grid(True)
+    plt.savefig("plots/trust_vs_weight.png", dpi=300)
+    plt.close()
+
+
+def plot_global_shap(shap_path="shap_outputs/global_shap.json", top_k=10):
+    if not os.path.exists(shap_path):
+        return
+
+    with open(shap_path, "r") as f:
+        shap_hist = json.load(f)
+
+    last_round = max(map(int, shap_hist.keys()))
+    shap_vals = shap_hist[str(last_round)]
+
+    features = list(shap_vals.keys())
+    values = np.array(list(shap_vals.values()))
+
+    idx = np.argsort(values)[::-1][:top_k]
+
+    plt.figure()
+    plt.barh([features[i] for i in idx[::-1]], values[idx[::-1]])
+    plt.xlabel("SHAP Importance")
+    plt.title(f"Top-{top_k} Global SHAP Features (Final Round)")
+    plt.savefig("plots/global_shap_topk.png", dpi=300)
+    plt.close()
 
 
 def _decode_bytes_to_ndarray(t: bytes) -> np.ndarray:
@@ -91,44 +197,42 @@ class FedReX(fl.server.strategy.FedAvg):
     # server.py (Rewritten FedReX.aggregate_evaluate)
 
     def aggregate_evaluate(self, rnd, results, failures):
-        # Call the default FedAvg aggregation for loss/acc etc.
         agg_results = super().aggregate_evaluate(rnd, results, failures)
-        
-        # --- SHAP aggregation to update self.global_shap ---
+
         shap_vecs, weights = [], []
-        for _, eval_res in results:
+
+        for client_proxy, eval_res in results:
             metrics = eval_res.metrics
             shap_metrics = {k: v for k, v in metrics.items() if k.startswith("shap_")}
+
             if shap_metrics:
                 max_idx = max((int(k.split("_")[1]) for k in shap_metrics), default=-1)
                 shap_vec = np.zeros(max_idx + 1)
+
                 for k, v in shap_metrics.items():
-                    idx = int(k.split("_")[1])
-                    if idx <= max_idx:
-                        shap_vec[idx] = v
-                
+                    shap_vec[int(k.split("_")[1])] = v
+
                 shap_vecs.append(shap_vec)
-                client_id = str(_)
+
+                # ✅ CONSISTENT CLIENT ID
+                client_id = str(client_proxy)
                 trust = self.historical_scores.get(client_id, 1.0)
                 weights.append(trust)
 
-        # --- Global SHAP Calculation and Feature Mapping ---
         if shap_vecs:
             shap_vecs = np.vstack(shap_vecs)
-            weights = np.array(weights)
-            weights = weights / weights.sum()
+            weights = np.array(weights, dtype=float)
+            weights = weights / weights.sum() if weights.sum() > 0 else np.ones(len(weights)) / len(weights)
 
             self.global_shap = np.average(shap_vecs, axis=0, weights=weights)
 
             while len(self.feature_names) < len(self.global_shap):
                 self.feature_names.append(f"Feature {len(self.feature_names)}")
 
-            round_data = {
+            self.global_shap_history[rnd] = {
                 self.feature_names[i]: float(self.global_shap[i])
                 for i in range(len(self.global_shap))
             }
-
-            self.global_shap_history[rnd] = round_data
 
             print(f"[Round {rnd}] Trust-weighted Global SHAP (Top-5):")
             for i in np.argsort(self.global_shap)[::-1][:5]:
@@ -138,8 +242,36 @@ class FedReX(fl.server.strategy.FedAvg):
             with open(self.global_shap_filename, "w") as f:
                 json.dump(self.global_shap_history, f, indent=4)
 
+            # ---- SAVE GLOBAL F1 ----
+            os.makedirs("metrics_outputs", exist_ok=True)
+            file_path = "metrics_outputs/fedrex_acc.json"
+
+            metrics_dict = agg_results[1] if isinstance(agg_results, tuple) else {}
+
+            data = json.load(open(file_path)) if os.path.exists(file_path) else []
+
+            accs = []
+            weights = []
+
+            for _, eval_res in results:
+                accs.append(eval_res.metrics.get("val_acc", 0.0))
+                weights.append(eval_res.num_examples)
+
+            accs = np.array(accs)
+            weights = np.array(weights)
+
+            global_acc = float(np.average(accs, weights=weights))
+
+
+            data.append({
+                "round": rnd,
+                "val_acc": global_acc
+            })
+
+            json.dump(data, open(file_path, "w"), indent=4)
+
         return agg_results
-    
+
     def score_performance(self, metrics, global_metrics):
         # Balanced accuracy improvement
         # Assume metrics["val_acc"] is balanced accuracy
@@ -360,6 +492,16 @@ class FedReX(fl.server.strategy.FedAvg):
         agg_params_obj = ndarrays_to_parameters(agg_ndarrays)
         self.current_parameters = agg_params_obj
 
+        # ---- SAVE TRUST HISTORY (NO SIDE EFFECTS) ----
+        os.makedirs("trust_outputs", exist_ok=True)
+        trust_history_json = {
+            cid: [float(v) for v in vals]
+            for cid, vals in self.trust_history.items()
+        }
+
+        with open("trust_outputs/trust_history.json", "w") as f:
+            json.dump(trust_history_json, f, indent=4)
+
         return agg_params_obj, {}
 
 
@@ -396,30 +538,101 @@ class FedReX(fl.server.strategy.FedAvg):
         return agg_params
 
 class FedAvgWithSHAP(fl.server.strategy.FedAvg):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        # --- SHAP-related state (FedAvg baseline) ---
+        self.global_shap = None
+        self.global_shap_history = {}
+        self.global_shap_filename = "shap_outputs/global_shap_fedavg.json"
+
+        # Feature names (same logic as FedReX, but independent)
+        try:
+            with open("shap_outputs/feature_names.json", "r") as f:
+                feature_data = json.load(f)
+                self.feature_names = feature_data.get(
+                    "0", [f"Feature {i}" for i in range(50)]
+                )
+        except FileNotFoundError:
+            self.feature_names = [f"Feature {i}" for i in range(50)]
+
     def aggregate_evaluate(self, rnd, results, failures):
         # Call the default FedAvg aggregation (accuracy, loss, etc.)
         agg_metrics = super().aggregate_evaluate(rnd, results, failures)
 
         # Collect SHAP vectors from clients
         shap_vecs, weights = [], []
-        for _, eval_res in results:
+        for client_proxy, eval_res in results:
             metrics = eval_res.metrics
+            shap_metrics = {k: v for k, v in metrics.items() if k.startswith("shap_")}
+            if shap_metrics:
+                max_idx = max((int(k.split("_")[1]) for k in shap_metrics), default=-1)
+                shap_vec = np.zeros(max_idx + 1)
+
+                for k, v in shap_metrics.items():
+                    shap_vec[int(k.split("_")[1])] = v
+
+                shap_vecs.append(shap_vec)
+
+                # ✅ CORRECT client ID
+                weights.append(eval_res.num_examples)
+
+            """
             if "shap" in metrics:
                 shap_vecs.append(np.array(metrics["shap"]))
                 weights.append(eval_res.num_examples)
-
+            """
         # Weighted average of SHAP importances across clients
         if shap_vecs:
             shap_vecs = np.vstack(shap_vecs)
             weights = np.array(weights, dtype=float)
-            weights /= weights.sum()
-            global_shap = np.average(shap_vecs, axis=0, weights=weights)
+            weights = weights / weights.sum() if weights.sum() > 0 else np.ones(len(weights)) / len(weights)
 
-            # Print top-5 features each round (indices only, since server doesn’t know names)
-            top_idx = np.argsort(global_shap)[::-1][:5]
-            print(f"[Round {rnd}] Global SHAP top-5 features (by index):")
-            for i in top_idx:
-                print(f"  Feature {i}: {global_shap[i]:.6f}")
+            self.global_shap = np.average(shap_vecs, axis=0, weights=weights)
+
+            while len(self.feature_names) < len(self.global_shap):
+                self.feature_names.append(f"Feature {len(self.feature_names)}")
+
+            self.global_shap_history[rnd] = {
+                self.feature_names[i]: float(self.global_shap[i])
+                for i in range(len(self.global_shap))
+            }
+
+            print(f"[Round {rnd}] Trust-weighted Global SHAP (Top-5):")
+            for i in np.argsort(self.global_shap)[::-1][:5]:
+                print(f"  {self.feature_names[i]}: {self.global_shap[i]:.6f}")
+
+            os.makedirs(os.path.dirname(self.global_shap_filename), exist_ok=True)
+            with open(self.global_shap_filename, "w") as f:
+                json.dump(self.global_shap_history, f, indent=4)
+
+            # ---- SAVE GLOBAL F1 ----
+            os.makedirs("metrics_outputs", exist_ok=True)
+            file_path = "metrics_outputs/fedavg_acc.json"
+
+            metrics_dict = agg_metrics[1] if isinstance(agg_metrics, tuple) else {}
+
+            data = json.load(open(file_path)) if os.path.exists(file_path) else []
+
+            accs = []
+            weights = []
+
+            for _, eval_res in results:
+                accs.append(eval_res.metrics.get("val_acc", 0.0))
+                weights.append(eval_res.num_examples)
+
+            accs = np.array(accs)
+            weights = np.array(weights)
+
+            global_acc = float(np.average(accs, weights=weights))
+
+
+            data.append({
+                "round": rnd,
+                "val_acc": global_acc
+            })
+
+            json.dump(data, open(file_path, "w"), indent=4)
 
         return agg_metrics
 
@@ -477,33 +690,62 @@ def extract_client_stats(metrics):
     return data_stats, privacy_info, robustness_stats, shap_vec
 
 
-def get_strategy():
+def get_strategy(strategy_name="fedrex"):
     def fit_config_fn(server_round: int):
         return {"local_epochs": 2}
 
-    # return FedAvgWithSHAP(
+    if strategy_name.lower() == "fedavg":
+        print("[SERVER] Running FedAvg baseline")
+        return FedAvgWithSHAP(
+            fraction_fit=1.0,
+            fraction_evaluate=1.0,
+            min_fit_clients=3,
+            min_evaluate_clients=3,
+            min_available_clients=3,
+            on_fit_config_fn=fit_config_fn,
+            accept_failures=False,
+            fit_metrics_aggregation_fn=None,
+            evaluate_metrics_aggregation_fn=None,
+        )
+
+    print("[SERVER] Running FedReX (trust-aware)")
     return FedReX(
-        fraction_fit=1.0,        # sample all clients each round (since we have 3)
+        fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=3,
         min_evaluate_clients=3,
         min_available_clients=3,
         on_fit_config_fn=fit_config_fn,
         accept_failures=False,
-        fit_metrics_aggregation_fn=passthrough_metrics,
-        evaluate_metrics_aggregation_fn=passthrough_metrics,
+        fit_metrics_aggregation_fn=None,
+        evaluate_metrics_aggregation_fn=None,
     )
 
+
 def main():
+    global RUN_TAG
+    strategy_name = "fedrex"
+    RUN_TAG = strategy_name
+    
+    if len(sys.argv) > 1:
+        strategy_name = sys.argv[1].lower()
+
     address = os.environ.get("BIND_ADDRESS", "0.0.0.0:8080")
-    strategy = get_strategy()
-    print(f"Starting Flower server on {address} …")
+    strategy = get_strategy(strategy_name)
+
+    print(f"Starting Flower server on {address} using strategy: {strategy_name}")
+
     fl.server.start_server(
-        server_address="0.0.0.0:8080",
-        config=fl.server.ServerConfig(num_rounds=10),
+        server_address=address,
+        config=fl.server.ServerConfig(num_rounds=30),
         strategy=strategy,
     )
 
+    # ---- Generate plots AFTER training ----
+    plot_trust_dynamics()
+    plot_acc_convergence()
+    plot_final_trust_vs_weight()
+    plot_global_shap()
 
 
 def compute_data_quality_stats(df, y):

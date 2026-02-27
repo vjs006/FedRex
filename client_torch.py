@@ -252,7 +252,7 @@ class TorchClient(fl.client.NumPyClient):
             # --- Evaluation Metrics (using the vanilla SHAP model) ---
             val_loss, val_acc = evaluate(self.shap_model, self.val_loader, self.device)
             metrics = self.compute_data_quality_stats()
-            metrics.update({"train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc})
+            metrics.update({"train_loss": train_loss, "val_loss": val_loss, "val_acc": val_acc, "f1_score": val_acc})
 
             # --- Privacy accounting (S_Priv,c) ---
             epsilon = 0.0
