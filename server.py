@@ -607,7 +607,7 @@ def save_global_model(parameters, strategy):
     }, "global_model_bundle.pt")
     
     print(f"[SERVER] Global model bundle saved with {len(feature_names)} features.")
-    
+
 def main():
     address = os.environ.get("BIND_ADDRESS", "0.0.0.0:8080")
     strategy = get_strategy()
@@ -616,7 +616,7 @@ def main():
 
     fl.server.start_server(
         server_address=address,
-        config=fl.server.ServerConfig(num_rounds=10),
+        config=fl.server.ServerConfig(num_rounds=30),
         strategy=strategy,
     )
 

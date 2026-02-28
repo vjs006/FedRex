@@ -104,7 +104,7 @@ def preprocess_input(data_dict, feature_names, scaler_path=SCALER_PATH):
     df_final = df.reindex(columns=feature_names, fill_value=0.0)
 
     # --- LOGGER 3: Final Verification ---
-    st.write(f"Final Column Count: {len(df_final.columns)}")
+    # st.write(f"Final Column Count: {len(df_final.columns)}")
     if len(df_final.columns) != 17:
         #st.error(f"⚠️ Mismatch! Reindex resulted in {len(df_final.columns)} columns, but Scaler needs 17.")
         pass
@@ -136,34 +136,47 @@ def preprocess_input(data_dict, feature_names, scaler_path=SCALER_PATH):
 def run_prediction(input_data):
     import os
     tensor = preprocess_input(input_data, feature_names)
-    st.write("DEBUG: Scaler exists?", os.path.exists(SCALER_PATH))
+    
+    # st.write("DEBUG: Scaler exists?", os.path.exists(SCALER_PATH))  # Debug line
+
     with torch.no_grad():
         logits = model(tensor)
         prob = torch.sigmoid(logits).item()
-        pred = 1 if prob >= 0.5 else 0
-    
-    st.write("Input tensor:", tensor)      # logs the input tensor values
-    st.write("Raw model probability:", prob)  # logs the predicted probability
+        risk_percent = prob * 100
 
-    # Display results
-    risk_percent = prob * 100
-    if pred == 1:
-        st.error("High Risk of Heart Disease")
+    # --- Determine Risk Category ---
+    if prob < 0.3:
+        risk_label = "Low Risk"
+        color_func = st.success
+        risk_message = "Your current metrics indicate a low probability of heart disease."
+    elif prob < 0.7:
+        risk_label = "Moderate Risk"
+        color_func = st.warning
+        risk_message = "Your metrics suggest a moderate risk. Consider lifestyle adjustments."
     else:
-        st.success("Low Risk of Heart Disease")
+        risk_label = "High Risk"
+        color_func = st.error
+        risk_message = "Your metrics indicate a high risk of heart disease. Please consult a physician."
 
+    # --- Display Risk Summary ---
+    st.divider()
+    st.subheader("Heart Disease Risk Assessment")
+    color_func(f"{risk_label}: {risk_percent:.1f}%")
+    st.info(risk_message)
+
+    # --- Progress Bar ---
     st.progress(min(int(risk_percent), 100))
-    st.markdown(f"### Risk Probability: **{risk_percent:.2f}%**")
 
-    # Probability interpretation
-    st.write(interpret_probability(prob))
-
-    # SHAP contributors
+    # --- Detailed Feature Contributions (if SHAP exists) ---
     contributors = get_top_contributors()
     if contributors is not None:
         st.divider()
-        st.subheader("Top contributing features")
-        st.dataframe(contributors, use_container_width=True)
+        st.subheader("Top Global Features Contributing to Risk")
+        st.dataframe(contributors, width = 'stretch')
+        top_features = ", ".join(contributors["Feature"].tolist())
+        st.markdown(
+            f"These are the top {len(contributors)} features globally contributing to heart risk predictions: **{top_features}**."
+        )
 
 # -------------------------------------------------
 # INTERPRET PROBABILITY
@@ -179,24 +192,42 @@ def interpret_probability(prob):
 # -------------------------------------------------
 # SHAP CONTRIBUTORS
 # -------------------------------------------------
-def get_top_contributors():
-    if global_shap is None:
+def get_top_contributors(top_n=5, shap_path="shap_outputs/global_shap.json"):
+    # Check if file exists
+    import os
+    if not os.path.exists(shap_path):
         return None
-    last_round = sorted(global_shap.keys(), key=lambda x: int(x))[-1]
-    shap_dict = global_shap[last_round]
-    shap_df = (
-        pd.DataFrame(shap_dict.items(), columns=["Feature", "Value"])
-        .sort_values("Value", ascending=False)
-        .head(3)
-    )
-    shap_df["Feature"] = shap_df["Feature"].map(FEATURE_TRANSLATIONS)
-    shap_df["Value"] = shap_df["Value"].round(4)
-    return shap_df
 
+    # Load the global SHAP JSON
+    with open(shap_path, "r") as f:
+        global_shap_json = json.load(f)
+
+    if len(global_shap_json) == 0:
+        return None
+
+    # Take last round if keys are numeric or just pick any
+    try:
+        last_round = sorted(global_shap_json.keys(), key=lambda x: int(x))[-1]
+    except ValueError:
+        last_round = list(global_shap_json.keys())[-1]
+
+    shap_dict = global_shap_json[last_round]
+
+    # Convert to DataFrame
+    shap_df = pd.DataFrame(list(shap_dict.items()), columns=["Feature", "SHAP Value"])
+    shap_df["Feature"] = shap_df["Feature"].map(FEATURE_TRANSLATIONS).fillna(shap_df["Feature"])
+    shap_df["SHAP Value"] = shap_df["SHAP Value"].astype(float)
+
+    # Sort by absolute value and pick top N
+    top_df = shap_df.reindex(shap_df["SHAP Value"].abs().sort_values(ascending=False).index).head(top_n)
+    top_df = top_df.reset_index(drop=True)
+
+    return top_df
 # -------------------------------------------------
 # UI
 # -------------------------------------------------
-tab1, tab2 = st.tabs(["Structured Input", "JSON Input"])
+st.header("Heart Risk Predictor - Federated Learning (FedReX)")
+tab1, tab2, tab3 = st.tabs(["Structured Input", "JSON Input", "Experiment Setup"])
 
 # TAB 1: Structured input
 with tab1:
@@ -253,3 +284,27 @@ with tab2:
             run_prediction(data)
         except Exception as e:
             st.error(f"Invalid JSON input: {e}")
+
+with tab3:
+    st.subheader("Federated Learning Experiment Overview")
+
+    # Experiment details
+    total_records = 70000
+    num_clients = 3
+    rounds = 30
+    data_per_client = total_records // num_clients
+    framework = "Flower (FLWR) + PyTorch"
+    flow = "Client-side training → Model aggregation → Global update"
+
+    st.markdown(f"""
+    **Total Records:** {total_records}  
+    **Number of Clients:** {num_clients}  
+    **Data per Client:** ~{data_per_client} records  
+    **Federated Rounds:** {rounds}  
+    **Framework:** {framework}  
+    **Training Flow:** {flow}
+    """)
+
+    st.divider()
+
+    st.info("This tab summarizes the experiment setup for the federated learning simulation.")
